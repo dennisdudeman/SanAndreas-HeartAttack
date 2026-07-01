@@ -9,7 +9,7 @@ This mod was only tested on the US 1.0 version of the game.
 
 ## Building
 
-You'll need Visual Studio (2019 or newer is fine) with the "Desktop
+You'll need Visual Studio 2022 or newer with the "Desktop
 development with C++" workload.
 
 1. Open `HeartAttack.vcxproj` in Visual Studio (or generate a new Win32 DLL
