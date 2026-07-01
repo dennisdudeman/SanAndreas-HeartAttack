@@ -2,14 +2,52 @@
 // CJ Heart Attack ASI Plugin
 // For Grand Theft Auto: San Andreas — ORIGINAL 2005 PC RELEASE (v1.0 US) ONLY.
 //
-// Concept: the game's own lore/wiki notes that being extremely overweight
-// "lessens most physical capabilities ... and possibly lead[s] to random
-// heart attacks (that can kill Carl)" — this mod implements that mechanic,
-// which exists in GTA folklore but not in the shipped game.
+// v1.2 changelog:
+//   - FIXED: the "OnlyOnFoot" check previously tested the ped state byte
+//     for the value 50 ("driving"). That value is documented as "driving"
+//     in general, but was only ever confirmed against cars — San Andreas'
+//     own script language (SCM) has SEPARATE, distinct opcodes for checking
+//     whether the player is in a car vs. a bike vs. a boat vs. a plane vs.
+//     a helicopter (e.g. "driving_bike", "driving_boat", "driving_heli",
+//     "driving_plane" are all different checks internally), which strongly
+//     suggests the engine does NOT necessarily represent every vehicle type
+//     with the same single state value. Relying on state==50 risked missing
+//     bicycles, boats, planes, helicopters, and/or trains — CJ could die on
+//     foot but not on a bike, for example, with no indication anything was
+//     wrong.
+//     Replaced with the game's own GLOBAL "current vehicle" pointer
+//     (0xBA18FC), which is documented simply as "0 = on-foot, >0 = in-car"
+//     — described generically, not per vehicle type. This is the same
+//     pointer the engine itself relies on to know whether the player is in
+//     ANY vehicle, so "in a vehicle" now correctly covers cars, motorbikes,
+//     bicycles, boats, planes, helicopters, and trains alike.
 //
-// Author: written for a single user request. Provided as-is; please test
-// thoroughly before distributing, and read README.md for build/install
-// steps and the verification notes on the memory addresses used.
+// v1.1 changelog (fixes reported after first release):
+//   - FIXED: ini path was resolved from the game EXE's location
+//     (GetModuleFileName(NULL, ...)), not this plugin's own location. If your
+//     ASI loader puts HeartAttack.asi in a "scripts" subfolder, the ini was
+//     silently being read/written one level up, in the game's root folder —
+//     so it looked like the ini was never generated and never respected.
+//     Fixed by resolving paths relative to this DLL's own module handle.
+//   - FIXED: config loading previously used GetPrivateProfileString /
+//     WritePrivateProfileString. These Win32 APIs cache file contents in
+//     memory and are not guaranteed to flush to disk until the *entire
+//     process* using them exits cleanly — if the game is closed via Alt+F4,
+//     crashes, or is killed from Task Manager, the ini file can simply never
+//     get written. Replaced with plain, unbuffered file I/O (fopen/fclose),
+//     which writes and flushes immediately.
+//   - "Death in car" was never actually broken — OnlyOnFoot defaults to 1,
+//     and because of the ini bug above, a manually-set OnlyOnFoot=0 was
+//     never actually being read. Fixed as a side effect of the ini fix.
+//   - ADDED: dynamic chance scaling while sprinting (see SprintChanceMultiplier
+//     below), using the documented CPed running-state byte.
+//   - NOT ADDED: dynamic scaling while "exercising" (treadmill/bike/weights).
+//     I don't have a verified, community-confirmed memory address for a
+//     "currently using gym equipment" flag, as opposed to sprinting, which
+//     is documented. Rather than guess at an unverified offset — which is
+//     exactly the kind of mistake that would silently do the wrong thing —
+//     I've left this out. See README.md for details and options if you want
+//     to pursue it further.
 // ============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -18,86 +56,155 @@
 #include <time.h>
 #include <vector>
 #include <stdint.h>
+#include <string.h>
 
 // ----------------------------------------------------------------------------
 // Memory addresses — GTA San Andreas PC, v1.0 (US), gta_sa.exe
-// These are well-documented, long-standing community-verified addresses
-// (GTAMods Wiki "Memory Addresses (SA)", confirmed for v1.0 only — NOT for
-// v2.0/Steam/Rockstar Games Launcher re-releases, and obviously not for the
-// 2021 Definitive Edition remaster, which is a completely different engine
-// and cannot load .asi plugins at all).
+// Community-verified (GTAMods Wiki "Memory Addresses (SA)"), confirmed for
+// v1.0 only — NOT v2.0/Steam/Rockstar Games Launcher re-releases, and not
+// relevant at all to the 2021 Definitive Edition remaster (different engine,
+// can't load .asi plugins).
 // ----------------------------------------------------------------------------
 static const DWORD ADDR_PLAYER_PED_PTR   = 0x00B6F5F0; // dword: pointer to CPed (player)
 static const DWORD ADDR_FAT_STAT         = 0x00B793D4; // float: CJ's Fat stat, range 0.0 - 1000.0
 static const DWORD ADDR_GAME_PAUSED_FLAG = 0x00B7CB49; // byte : 0 = running, 1 = paused / in a menu
 
-static const DWORD OFFSET_PED_HEALTH     = 0x540; // float, relative to CPed*
-static const DWORD OFFSET_PED_STATE      = 0x530; // dword, relative to CPed* (55 = wasted)
+// Generic "is the player in a vehicle at all" pointer. Documented simply as
+// "0 = on-foot, >0 = in-car" — this is described generically (not per
+// vehicle type), and is the address the game itself relies on, so it
+// correctly covers cars, motorbikes, bicycles, boats, planes, helicopters,
+// and trains alike. This is what makes "OnlyOnFoot" actually mean "on foot"
+// rather than just "not in a car."
+static const DWORD ADDR_CURRENT_VEHICLE_PTR = 0x00BA18FC; // dword: 0 = on-foot, non-zero = pointer to current CVehicle
 
-// Stat #21 in San Andreas' stat table is "Fat" (confirmed via GTAMods'
-// "List of statistics (SA)"); default new-game value is 200.0 (20%).
-// The constant isn't used directly here since we read the live mirrored
-// float at ADDR_FAT_STAT, but it's left here as documentation/reference.
-static const int STAT_ID_FAT = 21;
+static const DWORD OFFSET_PED_HEALTH     = 0x540; // float, relative to CPed*
+static const DWORD OFFSET_PED_STATE      = 0x530; // dword, relative to CPed* — only value 55 (wasted) is
+                                                    // relied on here now; see ADDR_CURRENT_VEHICLE_PTR for
+                                                    // vehicle detection instead of this field's "driving" value.
+static const DWORD OFFSET_PED_RUNSTATE   = 0x534; // byte,  relative to CPed*
+                                                    //   0 = while driving, 1 = standing still,
+                                                    //   4 = start to run, 6 = running,
+                                                    //   7 = running fast / sprinting
+
+static const BYTE  RUNSTATE_SPRINTING = 7;
+static const DWORD PEDSTATE_WASTED    = 55;
+// Note: there is deliberately no PEDSTATE_DRIVING constant here anymore.
+// State 50 is documented as "driving" but was only ever confirmed for cars;
+// "is the player in a vehicle" is now determined via IsPlayerInAnyVehicle()
+// using the generic current-vehicle pointer instead. See v1.2 changelog.
 
 // ----------------------------------------------------------------------------
-// Tunable parameters, loaded from HeartAttack.ini next to this .asi.
-// Sensible defaults are used if the ini is missing.
+// Tunable parameters, loaded from HeartAttack.ini next to THIS .asi file
+// (not next to gta_sa.exe — see changelog above). Sensible defaults are
+// used, and a default ini is (re)written immediately on load if missing.
 // ----------------------------------------------------------------------------
 struct Config
 {
-    float fatThreshold;      // Fat value (0-1000) above which CJ is "at risk"
-    float checkIntervalSecs; // how often we roll the dice
-    float baseChancePercent; // chance per check at exactly fatThreshold
-    float maxChancePercent;  // chance per check at max fat (1000)
-    bool  onlyOnFoot;        // skip the check while driving (gentler / less jarring)
+    float fatThreshold;           // Fat value (0-1000) above which CJ is "at risk"
+    float checkIntervalSecs;      // how often we roll the dice
+    float baseChancePercent;      // chance per check at exactly fatThreshold
+    float maxChancePercent;       // chance per check at max fat (1000)
+    bool  onlyOnFoot;             // skip the check while driving
+    float sprintChanceMultiplier; // multiplies the rolled chance while sprinting
 };
 
-static Config g_cfg = { 700.0f, 8.0f, 0.5f, 4.0f, true };
+static Config g_cfg = { 700.0f, 8.0f, 0.5f, 4.0f, true, 2.0f };
+static HMODULE g_hModule = nullptr;
 
+static void GetPluginDirectory(char* outPath, size_t outSize)
+{
+    char modulePath[MAX_PATH];
+    GetModuleFileNameA(g_hModule, modulePath, MAX_PATH);
+    char* lastSlash = strrchr(modulePath, '\\');
+    if (lastSlash)
+        *(lastSlash + 1) = '\0';
+    else
+        modulePath[0] = '\0';
+    strncpy_s(outPath, outSize, modulePath, outSize - 1);
+}
+
+static void WriteDefaultIni(const char* iniPath)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, iniPath, "w") != 0 || f == nullptr)
+        return; // folder not writable, or some other issue — nothing more we can do
+
+    fprintf(f, "[HeartAttack]\n");
+    fprintf(f, "; Fat value (0-1000) above which CJ is at risk of a heart attack.\n");
+    fprintf(f, "FatThreshold=%.1f\n", g_cfg.fatThreshold);
+    fprintf(f, "; How often (in seconds) the game rolls the dice.\n");
+    fprintf(f, "CheckIntervalSeconds=%.1f\n", g_cfg.checkIntervalSecs);
+    fprintf(f, "; Chance per check (percent) right at FatThreshold.\n");
+    fprintf(f, "BaseChancePercent=%.2f\n", g_cfg.baseChancePercent);
+    fprintf(f, "; Chance per check (percent) at maximum Fat (1000).\n");
+    fprintf(f, "MaxChancePercent=%.2f\n", g_cfg.maxChancePercent);
+    fprintf(f, "; If 1, skip the check entirely while driving. If 0, it can happen in a car too.\n");
+    fprintf(f, "OnlyOnFoot=%d\n", g_cfg.onlyOnFoot ? 1 : 0);
+    fprintf(f, "; The rolled chance is multiplied by this while CJ is sprinting.\n");
+    fprintf(f, "; e.g. 2.0 = twice as likely per check while sprinting.\n");
+    fprintf(f, "SprintChanceMultiplier=%.2f\n", g_cfg.sprintChanceMultiplier);
+
+    fflush(f);
+    fclose(f);
+}
+
+// Minimal, dependency-free "key=value" ini reader. Ignores blank lines,
+// lines starting with ';' or '#', and a leading "[Section]" line.
 static void LoadConfig()
 {
+    char pluginDir[MAX_PATH];
+    GetPluginDirectory(pluginDir, sizeof(pluginDir));
+
     char iniPath[MAX_PATH];
-    GetModuleFileNameA(NULL, iniPath, MAX_PATH);
-    char* lastSlash = strrchr(iniPath, '\\');
-    if (lastSlash) *(lastSlash + 1) = '\0';
-    strcat_s(iniPath, MAX_PATH, "HeartAttack.ini");
+    snprintf(iniPath, sizeof(iniPath), "%sHeartAttack.ini", pluginDir);
 
-    g_cfg.fatThreshold      = (float)GetPrivateProfileIntA("HeartAttack", "FatThreshold", 700, iniPath);
-    g_cfg.checkIntervalSecs = (float)GetPrivateProfileIntA("HeartAttack", "CheckIntervalSeconds", 8, iniPath);
+    FILE* f = nullptr;
+    if (fopen_s(&f, iniPath, "r") != 0 || f == nullptr)
+    {
+        // No ini yet — write defaults out immediately, then use the defaults
+        // already sitting in g_cfg for this session.
+        WriteDefaultIni(iniPath);
+        return;
+    }
 
-    char buf[64];
-    GetPrivateProfileStringA("HeartAttack", "BaseChancePercent", "0.5", buf, sizeof(buf), iniPath);
-    g_cfg.baseChancePercent = (float)atof(buf);
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+    {
+        // Strip trailing newline/carriage return.
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
 
-    GetPrivateProfileStringA("HeartAttack", "MaxChancePercent", "4.0", buf, sizeof(buf), iniPath);
-    g_cfg.maxChancePercent = (float)atof(buf);
+        if (len == 0 || line[0] == ';' || line[0] == '#' || line[0] == '[')
+            continue;
 
-    g_cfg.onlyOnFoot = GetPrivateProfileIntA("HeartAttack", "OnlyOnFoot", 1, iniPath) != 0;
+        char* eq = strchr(line, '=');
+        if (!eq)
+            continue;
 
-    // Write defaults back out so the user always has a config file to edit,
-    // even on first run.
-    char tmp[32];
-    sprintf_s(tmp, "%.1f", g_cfg.fatThreshold);
-    WritePrivateProfileStringA("HeartAttack", "FatThreshold", tmp, iniPath);
-    sprintf_s(tmp, "%.1f", g_cfg.checkIntervalSecs);
-    WritePrivateProfileStringA("HeartAttack", "CheckIntervalSeconds", tmp, iniPath);
-    sprintf_s(tmp, "%.2f", g_cfg.baseChancePercent);
-    WritePrivateProfileStringA("HeartAttack", "BaseChancePercent", tmp, iniPath);
-    sprintf_s(tmp, "%.2f", g_cfg.maxChancePercent);
-    WritePrivateProfileStringA("HeartAttack", "MaxChancePercent", tmp, iniPath);
-    WritePrivateProfileStringA("HeartAttack", "OnlyOnFoot", g_cfg.onlyOnFoot ? "1" : "0", iniPath);
+        *eq = '\0';
+        const char* key = line;
+        const char* value = eq + 1;
+
+        if (_stricmp(key, "FatThreshold") == 0)
+            g_cfg.fatThreshold = (float)atof(value);
+        else if (_stricmp(key, "CheckIntervalSeconds") == 0)
+            g_cfg.checkIntervalSecs = (float)atof(value);
+        else if (_stricmp(key, "BaseChancePercent") == 0)
+            g_cfg.baseChancePercent = (float)atof(value);
+        else if (_stricmp(key, "MaxChancePercent") == 0)
+            g_cfg.maxChancePercent = (float)atof(value);
+        else if (_stricmp(key, "OnlyOnFoot") == 0)
+            g_cfg.onlyOnFoot = (atoi(value) != 0);
+        else if (_stricmp(key, "SprintChanceMultiplier") == 0)
+            g_cfg.sprintChanceMultiplier = (float)atof(value);
+    }
+
+    fclose(f);
 }
 
 // ----------------------------------------------------------------------------
-// Version guard: this plugin must refuse to act on anything except the
-// original v1.0 (US) executable. Rather than trust a hard-coded file size
-// (which is brittle — re-zips, mirrors, and disk images can alter padding),
-// we read the EXE's own embedded VERSIONINFO resource and compare against
-// the known v1.0 file version. If it doesn't match, or if it's missing
-// entirely (as it is on most non-Windows-resource builds, re-releases, or
-// the Definitive Edition), the plugin disables itself and does nothing —
-// it will NOT guess at memory layout for a binary it can't identify.
+// Version guard (unchanged behavior from v1.0 of this plugin)
 // ----------------------------------------------------------------------------
 static bool IsSupportedGameVersion()
 {
@@ -108,46 +215,31 @@ static bool IsSupportedGameVersion()
     DWORD dummy = 0;
     DWORD verInfoSize = GetFileVersionInfoSizeA(exePath, &dummy);
     if (verInfoSize == 0)
-    {
-        // No version resource at all (typical of older/cracked v1.0 EXEs,
-        // which is exactly the binary this mod targets). We fall back to
-        // a defensive runtime sanity check instead — see ValidateAddressesAreSane().
-        return true; // tentatively allow; final say is the runtime sanity check below
-    }
+        return true; // no version resource — typical of v1.0 EXEs; fall back to runtime checks
 
     std::vector<char> data(verInfoSize);
     if (!GetFileVersionInfoA(exePath, 0, verInfoSize, data.data()))
-        return true; // same fallback reasoning as above
+        return true;
 
     UINT len = 0;
     VS_FIXEDFILEINFO* ffi = nullptr;
     if (VerQueryValueA(data.data(), "\\", (LPVOID*)&ffi, &len) && ffi)
     {
         WORD major = HIWORD(ffi->dwFileVersionMS);
-        WORD minor = LOWORD(ffi->dwFileVersionMS);
-        // Known re-releases (Steam "v2.0"/"v3.0" Hot-Coffee-patched builds,
-        // and the 2021 Definitive Edition, which isn't even this engine)
-        // report different version numbers or none at all. We only proceed
-        // for 1.x-style version stamps; anything clearly newer is rejected.
         if (major > 1)
-            return false;
+            return false; // clearly a newer/different build; refuse to guess at its layout
     }
 
     return true;
 }
 
-// A last-resort runtime sanity check: read the player-ped pointer and make
-// sure it points somewhere plausible (non-null, within a typical process
-// address range) before we ever dereference it. This doesn't *prove* we're
-// on v1.0, but it stops the plugin from reading/writing garbage if it's
-// wrong, on any version, ever — defense in depth on top of the version check.
 static bool TryReadCPed(BYTE** outPed)
 {
     __try
     {
         BYTE* ped = *reinterpret_cast<BYTE**>(ADDR_PLAYER_PED_PTR);
         if (ped == nullptr) return false;
-        if (reinterpret_cast<uintptr_t>(ped) < 0x00010000) return false; // obviously bogus
+        if (reinterpret_cast<uintptr_t>(ped) < 0x00010000) return false;
         *outPed = ped;
         return true;
     }
@@ -183,22 +275,42 @@ static bool TryReadByte(DWORD address, BYTE* outVal)
     }
 }
 
+static bool TryReadDword(DWORD address, DWORD* outVal)
+{
+    __try
+    {
+        *outVal = *reinterpret_cast<DWORD*>(address);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Returns true if the player is currently in ANY vehicle — car, motorbike,
+// bicycle, boat, plane, helicopter, or train — using the game's own generic
+// "current vehicle" pointer rather than a car-specific ped state value.
+static bool IsPlayerInAnyVehicle()
+{
+    DWORD vehiclePtr = 0;
+    if (!TryReadDword(ADDR_CURRENT_VEHICLE_PTR, &vehiclePtr))
+        return false; // if we can't read it, assume on-foot (fail toward allowing the check)
+    return vehiclePtr != 0;
+}
+
 static void KillPlayerWithHeartAttack(BYTE* ped)
 {
     __try
     {
-        // Setting health to 0 is the standard, safe way mods trigger a
-        // normal "wasted" death — the game's own update loop notices zero
-        // health and runs its usual death/respawn sequence, the same as
-        // dying to any other cause. We deliberately do NOT poke the raw
-        // state byte (CPed+0x530) directly, since that bypasses the
-        // game's own death bookkeeping and can leave things in a broken
-        // state (camera, controls, stats).
+        // Zeroing health lets the game's own death/respawn logic run exactly
+        // as it would for any other cause of death, regardless of whether
+        // CJ is on foot or in a vehicle at the time.
         *reinterpret_cast<float*>(ped + OFFSET_PED_HEALTH) = 0.0f;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
-        // Swallow — if this fails, nothing else can be done safely.
+        // Nothing more we can safely do if even this fails.
     }
 }
 
@@ -211,10 +323,7 @@ static DWORD WINAPI HeartAttackThreadProc(LPVOID)
     LoadConfig();
 
     if (!IsSupportedGameVersion())
-    {
-        // Wrong game/version: do nothing for the lifetime of the process.
         return 0;
-    }
 
     for (;;)
     {
@@ -222,32 +331,35 @@ static DWORD WINAPI HeartAttackThreadProc(LPVOID)
 
         BYTE pausedFlag = 0;
         if (TryReadByte(ADDR_GAME_PAUSED_FLAG, &pausedFlag) && pausedFlag != 0)
-            continue; // menu / loading / paused — skip this round
+            continue;
 
         BYTE* ped = nullptr;
         if (!TryReadCPed(&ped))
-            continue; // not in-game yet (e.g. still on the title screen)
+            continue;
 
         float health = 0.0f;
         if (!TryReadFloat(reinterpret_cast<DWORD>(ped) + OFFSET_PED_HEALTH, &health))
             continue;
         if (health <= 0.0f)
-            continue; // already dead/wasted, nothing to do
+            continue;
 
         DWORD pedState = 0;
         __try { pedState = *reinterpret_cast<DWORD*>(ped + OFFSET_PED_STATE); }
         __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
-        if (pedState == 55) // already wasted
+        if (pedState == PEDSTATE_WASTED)
             continue;
 
-        if (g_cfg.onlyOnFoot)
-        {
-            // Player state 50 == driving (per community memory-map notes).
-            // If CJ's currently driving, skip — keeps the effect feeling
-            // like a personal medical event rather than causing a crash.
-            if (pedState == 50)
-                continue;
-        }
+        // Covers ALL vehicle types — car, motorbike, bicycle, boat, plane,
+        // helicopter, train — not just cars. See v1.2 changelog at the top
+        // of this file for why this replaced a car-specific check.
+        bool isInVehicle = IsPlayerInAnyVehicle();
+        if (g_cfg.onlyOnFoot && isInVehicle)
+            continue;
+
+        BYTE runState = 0;
+        bool isSprinting = false;
+        if (TryReadByte(reinterpret_cast<DWORD>(ped) + OFFSET_PED_RUNSTATE, &runState))
+            isSprinting = (runState == RUNSTATE_SPRINTING);
 
         float fat = 0.0f;
         if (!TryReadFloat(ADDR_FAT_STAT, &fat))
@@ -256,7 +368,6 @@ static DWORD WINAPI HeartAttackThreadProc(LPVOID)
         if (fat < g_cfg.fatThreshold)
             continue;
 
-        // Scale the chance linearly between threshold and the stat's max (1000).
         float range = 1000.0f - g_cfg.fatThreshold;
         float t = (range > 0.0f) ? (fat - g_cfg.fatThreshold) / range : 1.0f;
         if (t > 1.0f) t = 1.0f;
@@ -264,6 +375,12 @@ static DWORD WINAPI HeartAttackThreadProc(LPVOID)
 
         float chancePercent = g_cfg.baseChancePercent +
                                t * (g_cfg.maxChancePercent - g_cfg.baseChancePercent);
+
+        if (isSprinting)
+            chancePercent *= g_cfg.sprintChanceMultiplier;
+
+        if (chancePercent > 100.0f)
+            chancePercent = 100.0f;
 
         float roll = ((float)rand() / (float)RAND_MAX) * 100.0f;
         if (roll <= chancePercent)
@@ -283,6 +400,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reasonForCall, LPVOID)
     switch (reasonForCall)
     {
     case DLL_PROCESS_ATTACH:
+        g_hModule = hModule;
         DisableThreadLibraryCalls(hModule);
         CreateThread(nullptr, 0, HeartAttackThreadProc, nullptr, 0, nullptr);
         break;

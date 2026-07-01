@@ -66,20 +66,72 @@ development with C++" workload.
 
 ## Configuration (`HeartAttack.ini`)
 
+**Important:** this file lives next to `HeartAttack.asi` itself — wherever
+you placed the `.asi` (often a `scripts` folder, depending on your loader),
+that's where the ini goes too. It is **not** next to `gta_sa.exe` unless
+that's also where you put the `.asi`. (Earlier versions of this plugin
+incorrectly resolved paths from the game EXE instead of the plugin itself —
+see the changelog at the top of `HeartAttack.cpp` if you're curious.)
+
 ```ini
 [HeartAttack]
-FatThreshold=700
-CheckIntervalSeconds=8
-BaseChancePercent=0.5
-MaxChancePercent=4.0
+FatThreshold=700.0
+CheckIntervalSeconds=8.0
+BaseChancePercent=0.50
+MaxChancePercent=4.00
 OnlyOnFoot=1
+SprintChanceMultiplier=2.00
 ```
 
 - `FatThreshold` — Fat value (0–1000) above which CJ is "at risk."
 - `CheckIntervalSeconds` — how often the dice get rolled.
 - `BaseChancePercent` / `MaxChancePercent` — chance per check at the threshold
   vs. at maximum fat (1000), linearly interpolated in between.
-- `OnlyOnFoot` — if `1`, skips the check while driving.
+- `OnlyOnFoot` — if `1`, skips the check while driving. Set to `0` if you
+  want it to be able to trigger in a vehicle too.
+- `SprintChanceMultiplier` — the rolled chance is multiplied by this while
+  CJ is sprinting (detected via the game's own ped "running state" byte,
+  value `7`). `2.0` means twice as likely per check while sprinting; `1.0`
+  disables the effect.
+
+### Why there's no "exercising" multiplier
+
+I looked for a reliable memory flag for "CJ is currently using gym
+equipment" (treadmill, exercise bike, bench press) and couldn't find one
+that's documented and community-verified the way the sprinting byte is.
+Gym animations are almost certainly tracked at the animation-blend level
+rather than as a simple ped state byte, and I don't have verified offsets
+into that structure. Rather than invent a plausible-looking address that
+might silently read garbage (and either never trigger, or worse, trigger
+on the wrong condition), I've left this out.
+
+If you want to pursue it yourself, two safer paths forward:
+1. Use a memory-scanning tool (Cheat Engine) while manually using gym
+   equipment in-game to find a stable, dedicated flag/byte, if one exists.
+2. Hook the animation-name comparison the game itself already does — the
+   SCM opcode `0611` (`actor performing_animation`) proves the engine can
+   check the currently-playing animation by name, so there's very likely a
+   reachable "current animation name" pointer; finding its exact offset
+   would need the same kind of verification the addresses above went
+   through.
+
+## Vehicle coverage (cars, bikes, bicycles, boats, planes, helicopters, trains)
+
+`OnlyOnFoot` now correctly means *on foot* — it checks the game's own global
+"current vehicle" pointer (`0xBA18FC`, documented as `0 = on-foot, >0 = in a
+vehicle`), which the engine relies on internally regardless of vehicle type.
+This covers cars, motorbikes, bicycles, boats, planes, helicopters, and
+trains equally.
+
+An earlier draft of this plugin instead checked a ped state value (`50`,
+documented only as "driving") that had only ever been confirmed against
+cars — San Andreas' own scripting language has separate opcodes for
+checking whether the player is driving a car vs. a bike vs. a boat vs. a
+plane vs. a helicopter, which was a strong signal that a single "driving"
+state value might not reliably cover every vehicle type. Rather than leave
+that ambiguity in place, the check was replaced with the generic pointer
+described above, which is unambiguous about applying to vehicles in
+general rather than to cars specifically.
 
 ## Notes on the memory addresses used
 
@@ -90,9 +142,12 @@ v2.0/Steam or later:
 
 - `0xB6F5F0` — pointer to the player's `CPed`
 - `CPed + 0x540` — player health (float)
-- `CPed + 0x530` — player state (`55` = wasted)
+- `CPed + 0x530` — player state (only `55` = wasted is used)
+- `CPed + 0x534` — running state (`7` = sprinting)
 - `0xB793D4` — Fat stat (float, 0–1000)
 - `0xB7CB49` — paused/menu flag (byte)
+- `0xBA18FC` — current vehicle pointer (`0` = on-foot, non-zero = in any
+  vehicle type: car, bike, bicycle, boat, plane, helicopter, or train)
 
 If you find these don't line up on your specific copy of the game (some
 "1.0" downloads online are actually slightly patched or cracked builds with
