@@ -1,4 +1,4 @@
-# San Andreas: Heart Attack — .ASI plugin for Grand Theft Auto: San Andreas.
+# San Andreas: Heart Attack - an .ASI plugin for Grand Theft Auto: San Andreas.
 
 If CJ's Fat stat gets too high, there's now a small chance that he keels over with a heart attack — a normal "wasted" death, the
 same as any other cause of death in the game.
