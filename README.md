@@ -1,7 +1,11 @@
 # Heart Attack - an .ASI plugin for Grand Theft Auto: San Andreas.
 
-If CJ's Fat stat gets too high, there's now a small chance that he keels over with a heart attack — a normal "wasted" death, the
-same as any other cause of death in the game.
+- **Heart Attack** (fatal) — above a configurable Fat threshold, there's a
+  small per-check chance CJ simply drops dead from a heart attack. This is a
+  normal "wasted" death, the same as any other cause of death in the game.
+- **Heart Palpitations** (non-lethal) — a lesser, more frequent event at a
+  lower Fat threshold: CJ loses a random chunk of health (never enough to
+  kill him) and a random CJ pain sound plays.
 
 ## Compatibility
 
@@ -36,15 +40,34 @@ BaseChancePercent=0.50
 MaxChancePercent=4.00
 OnlyOnFoot=1
 SprintChanceMultiplier=2.00
+
+[HeartPalpitations]
+Enabled=1
+FatThreshold=400.0
+BaseChancePercent=1.00
+MaxChancePercent=6.00
+SprintChanceMultiplier=2.00
+MinHealthLoss=5.0
+MaxHealthLoss=25.0
+MinHealthAfter=10.0
+PlaySound=1
 ```
 
-- `FatThreshold` — Fat value (0–1000) above which CJ is "at risk."
-- `CheckIntervalSeconds` — how often the dice get rolled.
-- `BaseChancePercent` / `MaxChancePercent` — chance per check at the threshold
-  vs. at maximum fat (1000), linearly interpolated in between.
-- `OnlyOnFoot` — if `1`, skips the check while driving. Set to `0` if you
-  want it to be able to trigger in a vehicle too.
-- `SprintChanceMultiplier` — the rolled chance is multiplied by this while
-  CJ is sprinting (detected via the game's own ped "running state" byte,
-  value `7`). `2.0` means twice as likely per check while sprinting; `1.0`
-  disables the effect.
+**`[HeartAttack]`** (fatal):
+- `FatThreshold` — Fat value (0–1000) above which CJ is at risk.
+- `CheckIntervalSeconds` — how often the dice are rolled, for both features.
+- `BaseChancePercent` / `MaxChancePercent` — chance per check at the
+  threshold vs. at max Fat (1000), linearly interpolated in between.
+- `OnlyOnFoot` — if `1`, skips the heart-attack check while in any vehicle.
+- `SprintChanceMultiplier` — multiplies the rolled chance while sprinting.
+
+**`[HeartPalpitations]`** (non-lethal):
+- `Enabled` — master on/off switch for this feature.
+- `FatThreshold` — usually lower than the fatal one, since this isn't lethal.
+- `BaseChancePercent` / `MaxChancePercent` — same interpolation as above.
+- `SprintChanceMultiplier` — multiplies the rolled chance while sprinting.
+- `MinHealthLoss` / `MaxHealthLoss` — a random amount of health in this range
+  is lost each time one occurs.
+- `MinHealthAfter` — health will never be pushed below this by a palpitation.
+- `PlaySound` — if `1`, plays a random embedded pain sound each time.
+
